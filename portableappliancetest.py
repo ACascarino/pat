@@ -5,6 +5,8 @@
 # electrical safety and interoperability
 # Usage: ./portableappliancetest.py <input.sss>
 #
+# Ported to Python 3 by Angel Cascarino, 2019-02-01
+#
 # = PAT Testing =
 # Portable Appliance Testing (PAT Inspections) are tests undertaken on
 # electrical equipment before they can be used in a workplace.  A
@@ -71,59 +73,66 @@
 # Add option to output ASCII is same format as meter (requires example)
 # Add option to output .csv
 
-import struct, sys
-import string
+import struct
+import sys
 import collections
-import StringIO
+from io import BytesIO
 
 # Code is in the main() function at the bottom.  Above are helper
 # classes, and then classes for parsing the 'SSS' format itself.
 
 # Not-invented-here Structured Database Helper class
-class sdb(object):
+class Sdb():
     """Structured database class, not related to 'SSS' specifically.  It is
     a helper class for describing binary databases and gets used later
     below; variants of 'sdb' have been re-used over the years on various
     file-format parsers."""
-
+    fields = []
     field_pack_format = {int: 'I'}
+
     def __init__(self, endian='<'):
         self.data = collections.OrderedDict()
-        self.build_format_string(endian = endian)
+        self.build_format_string(endian=endian)
+
+    def fixup(self):
+        pass
 
     def build_format_string(self, endian):
         self.endian = endian
-        s = ''
-        for name, type, size in self.fields:
-            if type == int and size == 1: s += 'B'
-            elif type == int and size == 2: s += 'H'
-            elif type == int and size == 4: s += 'L'
-            elif type == str:
-                s += str(size) + 's'
+        type_string = ''
+        for __, format_type, size in self.fields:
+            if format_type == int and size == 1:
+                type_string += 'B'
+            elif format_type == int and size == 2:
+                type_string += 'H'
+            elif format_type == int and size == 4:
+                type_string += 'L'
+            elif format_type == str:
+                type_string += str(size) + 's'
             else:
-                s += self.field_pack_format[type]
-        self.format_string = self.endian + s
+                type_string += self.field_pack_format[format_type]
+        self.format_string = self.endian + type_string
         self.required_length = struct.calcsize(self.format_string)
-        
-    def unpack(self, s):
-        u = list(struct.unpack(self.format_string, s))
-        for name, type, size in self.fields:
-            if type == str:
-                u[0] = u[0].replace('\x00', '').rstrip()
-            self.data[name] = type(u.pop(0))
+
+    def unpack(self, structure):
+        unpacked = list(struct.unpack(self.format_string, structure))
+        for name, format_type, __ in self.fields:
+            if format_type == str:
+                unpacked[0] = unpacked[0].replace(b'\x00', b'').rstrip()
+            self.data[name] = unpacked.pop(0)
         return self
 
     def headings(self):
-        return [name for name, type, size in self.fields]
+        return [name for name, format_type, size in self.fields]
 
     def values(self):
         return self.data.values()
 
     def items_dict(self):
-        s = '{'
-        s += ', '.join(['%s:%s' % (k, `v`) for k, v in self.data.items()])
-        s += '}'
-        return s
+        dictionary = '{'
+        dictionary += ', '.join(['%s:%s' % (key, value) for key, value in self.data.items()])
+        dictionary += '}'
+        return dictionary
 
     def __len__(self):
         return self.required_length
@@ -131,29 +140,33 @@ class sdb(object):
     def __str__(self):
         return str(self.data)
 
-# This sub-class for the SSS stream-format, most 
-class SSS(sdb):
+# This sub-class for the SSS stream-format, most
+class SSS(Sdb):
     def __init__(self):
         super(SSS, self).__init__(endian='>')
-        
+
     def fixup(self):
         pass
-    def unpack(self, s):
-        r = super(SSS, self).unpack(s)
-        r.fixup()
+
+    def unpack(self, structure):
+        unpacked = super(SSS, self).unpack(structure)
+        unpacked.fixup()
         return self
+
     def rescale(self, key):
         self.data[key] = (10**-(self.data[key] >> 14)) * (self.data[key] & 0x3fff)
-    def passed(self, key = 'pass'):
+
+    def passed(self, key='pass'):
         self.data[key] = bool(self.data[key] == 1)
 
 class SSSRecordHeader(SSS):
     fields = [('payload_length', int, 2),
               ('nulls', int, 2),
               ('checksum_header', int, 2)]
+
     def checksum(self, payload):
         # checksum is the sum value of all the bytes in the payload portion
-        self.data['checksum_payload'] = sum(map(ord,payload)) & 0xffff
+        self.data['checksum_payload'] = sum(payload) & 0xffff
         match = (self.data['checksum_header'] == self.data['checksum_payload'])
         self.data['checksum_match'] = match
         return match
@@ -178,6 +191,7 @@ class SSSNoDataTest(SSS):
 class SSSEarthResistanceTest(SSS):
     fields = [('resistance', int, 2),
               ]
+
     def fixup(self):
         self.rescale('resistance')
 
@@ -186,6 +200,7 @@ class SSSEarthResistanceTestv2(SSS):
               ('pass', int, 1),
               ('resistance', int, 2),
               ]
+
     def fixup(self):
         self.rescale('resistance')
         self.passed()
@@ -193,6 +208,7 @@ class SSSEarthResistanceTestv2(SSS):
 class SSSEarthInsulationTest(SSS):
     fields = [('resistance', int, 2),
               ]
+
     def fixup(self):
         self.rescale('resistance')
         # Note: the displayed resistance for the Earth Insulation test
@@ -208,6 +224,7 @@ class SSSEarthInsulationTest(SSS):
 class SSSCurrentTest(SSS):
     fields = [('current', int, 2),
               ]
+
     def fixup(self):
         self.rescale('current')
 
@@ -215,6 +232,7 @@ class SSSCurrentTestv2(SSS):
     fields = [('pass', int, 1),
               ('current', int, 2),
               ]
+
     def fixup(self):
         self.rescale('current')
         self.passed()
@@ -223,6 +241,7 @@ class SSSEarthInsulationTestv2(SSS):
     fields = [('pass', int, 1),
               ('resistance', int, 2),
               ]
+
     def fixup(self):
         self.rescale('resistance')
         self.passed()
@@ -231,6 +250,7 @@ class SSSPowerLeakTest(SSS):
     fields = [('leakage', int, 2),
               ('load', int, 2),
               ]
+
     def fixup(self):
         # Note: The 10/16ths current (load) scaling factor was
         # obtained from a sample size of two results only, both of
@@ -243,6 +263,7 @@ class SSSPowerLeakTestv2(SSS):
               ('leakage', int, 2),
               ('load', int, 2),
               ]
+
     def fixup(self):
         self.data['pass'] = bool(self.data['pass'])
         self.rescale('leakage')
@@ -251,6 +272,7 @@ class SSSPowerLeakTestv2(SSS):
 class SSSContinuityTest(SSS):
     fields = [('resistance', int, 2),
               ]
+
     def fixup(self):
         self.rescale('resistance')
         # Zero appears to correspond to infinity (no connection).
@@ -264,6 +286,7 @@ class SSSContinuityTestv2(SSS):
     fields = [('pass', int, 1),
               ('resistance', int, 2),
               ]
+
     def fixup(self):
         self.rescale('resistance')
         self.passed()
@@ -286,9 +309,10 @@ class SSSUserDataMappingTest(SSS):
                 3: 'Make',
                 4: 'Model',
                 5: 'Serial No.'}
+
     def fixup(self):
-        for k,v in self.data.items():
-            self.data['meaning' + k[-1]] = self.mappings[v]
+        for key, value in list(self.data.items()):
+            self.data['meaning' + key[-1]] = self.mappings[value]
 
 class SSSRetestTest(SSS):
     fields = [('nulls', int, 1),
@@ -312,18 +336,7 @@ class SSSUserDataTest(SSS):
               ('line4', str, 21),
               ]
 
-# Field types:
-# 0x01 86x Main record (Asset, Datetime, Site, Location, Tester, Testcode 1, Testcode 2)
-# 0xf0 Pass
-# 0xf1 Fail
-# 0xf2 1H (Ohm) Earth resistance test (top-bit pass/fail flag?)
-# 0xf3 1H (kOhm) Insulation
-# 0xf6 2H Two values (Ohm or mA?)
-# 0xf8 1H mA?
-# 0xfb Freeform text/failure description (4*21 characters)
-# 0xff End of record
-
-TestsVersion1 = {
+TESTS_VERSION_1 = {
     0x01: ('Visual Pass (01)', SSSVisualTest),
     0x02: ('Visual Fail (02)', SSSVisualTest),
     0x10: ('Unknown (10)', SSSNoDataTest),
@@ -338,12 +351,13 @@ TestsVersion1 = {
     0xf6: ('Load/Leakage (F6)', SSSPowerLeakTest),
     0xf7: ('Flash Leakage (F5)', SSSCurrentTest),
     0xf8: ('Continuity (F8)', SSSContinuityTest),
+    0xfa: ('Unknown (FA)', SSSNoDataTest),
     0xfb: ('User data (FB)', SSSUserDataTest),
     0xfe: ('Software Version (FE)', SSSSoftwareVersionTest),
     0xff: ('End of Record (FF)', SSSNoDataTest),
     }
 
-TestsVersion2 = {
+TESTS_VERSION_2 = {
     0x11: ('Visual Pass v2 (11)', SSSVisualTest),
     0x12: ('Visual Fail v2 (12)', SSSVisualTest),
     0xf2: ('Earth Resistance v2 (F2)', SSSEarthResistanceTestv2),
@@ -360,58 +374,61 @@ class SSSSyntaxError(SyntaxError):
     pass
 
 def parse_sss(filehandle):
-    f = filehandle
-    r = SSSRecordHeader()
-    for header in iter(lambda: f.read(len(r)), ''):
-        Tests = TestsVersion1.copy()
-        version = 1
+    record_header = SSSRecordHeader()
 
-        r.unpack(header)
-        payload = f.read(r.data['payload_length'])
-        validated = r.checksum(payload)
-        #print 'Checksum {pass: %s}' % bool(checksum == r.data['checksum'])
-        print 'New Record', r.items_dict()
-        if r.data['payload_length'] == 0:
-            raise SSSSyntaxError('Zero length payload')
-        if not validated:
-            raise SSSSyntaxError('Checksum validation failed')
-            return
-        test_type = None
-        while len(payload) and test_type != 0xff:
-            test_type = ord(payload[0])
-            payload = payload[1:]
-            # Add in newer-style records if detected by presence of 0x11/0x12
-            if version == 1 and test_type in (0x11, 0x12):
-                version += 1
-                Tests.update(TestsVersion2)
-            t = Tests[test_type][1]()
-            # Unpack the current sub-field
-            t.unpack(payload[:len(t)])
-            print Tests[test_type][0], t.items_dict()
+    while True:
+        header = filehandle.read(len(record_header))
+        if not header:
+            break
+        parse_record(filehandle, record_header, header)
 
-            # Seek past to start of next sub-field
-            payload = payload[len(t):]
-            #print `payload`
+def parse_record(filename, record_header, header):
+    tests = TESTS_VERSION_1.copy()
+    version = 1
 
-        # Line-break between records.
-        print
+    record_header.unpack(header)
+    payload = filename.read(record_header.data['payload_length'])
+    validated = record_header.checksum(payload)
+    
+    print('New Record', record_header.items_dict())
+    if record_header.data['payload_length'] == 0:
+        raise SSSSyntaxError('Zero length payload')
+    if not validated:
+        raise SSSSyntaxError('Checksum validation failed')
+
+    test_type = None
+    while payload and test_type != 0xff:
+        test_type = payload[0]
+        payload = payload[1:]
+        # Add in newer-style records if detected by presence of 0x11/0x12
+        if version == 1 and test_type in (0x11, 0x12):
+            version += 1
+            tests.update(TESTS_VERSION_2)
+        current_test = tests[test_type][1]()
+        # Unpack the current sub-field
+        current_test.unpack(payload[:len(current_test)])
+        print(tests[test_type][0], current_test.items_dict())
+
+        # Seek past to start of next sub-field
+        payload = payload[len(current_test):]
+    print()
 
 def main():
-    if len (sys.argv) < 2:
-        print >>sys.stderr, "usage: %s [input.sss]" % sys.argv[0]
+    if len(sys.argv) < 2:
+        print("usage: %s [input.sss]" % sys.argv[0], file=sys.stderr)
         sys.exit(2)
 
     # Simplify testing/dumping by allowing multiple input files on the command-line
     for filename in sys.argv[1:]:
-        print 'trying "%s"' % filename
-        f = open(filename, 'r')
-        contents = f.read()
-        wrapped = StringIO.StringIO(contents)
+        print('trying "%s"' % filename)
+        file = open(filename, 'rb')
+        contents = file.read()
+        wrapped = BytesIO(contents)
         try:
             parse_sss(wrapped)
-        except SSSSyntaxError, message:
-            print 'End File {Error:"%s"}' % message
+        except (SSSSyntaxError) as message:
+            print('End File {Error:"%s"}' % message)
             continue
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
