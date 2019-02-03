@@ -76,6 +76,8 @@
 import struct
 import sys
 import collections
+import xlsxwriter
+import datetime
 from io import BytesIO
 
 # Code is in the main() function at the bottom.  Above are helper
@@ -119,6 +121,7 @@ class Sdb():
         for name, format_type, __ in self.fields:
             if format_type == str:
                 unpacked[0] = unpacked[0].replace(b'\x00', b'').rstrip()
+                unpacked[0] = unpacked[0].decode('utf-8')
             self.data[name] = unpacked.pop(0)
         return self
 
@@ -373,30 +376,42 @@ TESTS_VERSION_2 = {
 class SSSSyntaxError(SyntaxError):
     pass
 
-def parse_sss(filehandle):
+def static_vars(**kwargs):
+    def decorate(func):
+        for k in kwargs:
+            setattr(func, k, kwargs[k])
+        return func
+    return decorate
+
+def parse_sss(filehandle, output_workbook):
     record_header = SSSRecordHeader()
+
+    record_id = 1
 
     while True:
         header = filehandle.read(len(record_header))
-        if not header:
+        if header:
+            record_header.unpack(header)
+        else:
             break
-        parse_record(filehandle, record_header, header)
+        parse_record(filehandle, record_header, record_id, output_workbook)
+        
+        record_id += 1
 
-def parse_record(filename, record_header, header):
+@static_vars(test_id=1)
+def parse_record(filename, record_header, record_id, output_workbook):
     tests = TESTS_VERSION_1.copy()
     version = 1
-
-    record_header.unpack(header)
     payload = filename.read(record_header.data['payload_length'])
     validated = record_header.checksum(payload)
 
-    print('New Record', record_header.items_dict())
     if record_header.data['payload_length'] == 0:
         raise SSSSyntaxError('Zero length payload')
     if not validated:
         raise SSSSyntaxError('Checksum validation failed')
 
     test_type = None
+
     while payload and test_type != 0xff:
         test_type = payload[0]
         payload = payload[1:]
@@ -407,11 +422,69 @@ def parse_record(filename, record_header, header):
         current_test = tests[test_type][1]()
         # Unpack the current sub-field
         current_test.unpack(payload[:len(current_test)])
-        print(tests[test_type][0], current_test.items_dict())
+
+        tests_written = report_record(record_id, current_test, test_type, parse_record.test_id, output_workbook)
+        parse_record.test_id += tests_written
 
         # Seek past to start of next sub-field
         payload = payload[len(current_test):]
-    print()
+
+def report_record(record_id, current_test, test_type, test_id, output_workbook):
+    item_sheet, record_sheet, test_sheet = output_workbook.worksheets()
+
+    #Set up constants for easy readability further down.
+    #These influence the columns that each record type writes to.
+    SOFTWARE_COLUMN = 8
+    RECORD_DATA_COLUMN = 1
+
+    tests_written = 0
+
+    data_values = list(current_test.data.values())
+
+    if test_type in (0x01, 0x02, 0x11, 0x12, 0xfe):
+        #These all modify the 'record' sheet
+        if test_type == 0xfe:
+            #This contains data on tester serial number and firmware version
+            #Combine firmware version into one string
+            firmware_version = '%d.%d.%d' % tuple(data_values[1:])
+            package = [data_values[0], firmware_version]
+
+            record_sheet.write_row(record_id, SOFTWARE_COLUMN, package)
+        else:
+            #This contains data on the record itself (time, place, tester)
+            #Combine date-time related fields into a timestamp
+            hour, minute, day, month, year = data_values[1:6]
+            timestamp = datetime.datetime(year, month, day, hour, minute)
+            package = [data_values[0], timestamp, *data_values[6:]]
+
+            record_sheet.write_row(record_id, RECORD_DATA_COLUMN, package)
+        record_sheet.write(record_id + 1, 0, record_id)
+        
+    elif test_type in range(0xf0, 0xfb) or test_type == 0x10:
+        #All the tests have different field meanings, so we'll just combine
+        test_sheet.write_row(test_id, 0, [test_id, record_id, test_type, *data_values])
+        tests_written += 1
+
+    elif test_type in (0xe1, 0xe2, 0xfb):
+        pass #do the item things
+    else:
+        pass
+
+    return tests_written
+
+def initialise_output(filename):
+    output_workbook = xlsxwriter.Workbook(filename + '_output.xlsx', {'default_date_format': 'yyyy-mm-ddThh:mm'})
+
+    item_sheet = output_workbook.add_worksheet("Items")
+    item_sheet.write_row('A1', ['Item ID', 'Retest Freq.', "String 1", "String 2", "String 3", "String 4"])
+
+    record_sheet = output_workbook.add_worksheet("Records")
+    record_sheet.write_row('A1', ["Record ID", "Item ID", "Timestamp", "Site", "Location", "Tester", "Testcode 1", "Testcode2", "Serial No.", "Firmware Version"])
+
+    test_sheet = output_workbook.add_worksheet("Tests")
+    test_sheet.write_row('A1', ["Test ID", "Record ID", "Test Type", "Test Parameter 1", "Test Parameter 2", "Test Parameter 3"])
+
+    return output_workbook
 
 def main():
     if len(sys.argv) < 2:
@@ -421,14 +494,17 @@ def main():
     # Simplify testing/dumping by allowing multiple input files on the command-line
     for filename in sys.argv[1:]:
         print('trying "%s"' % filename)
-        file = open(filename, 'rb')
-        contents = file.read()
-        wrapped = BytesIO(contents)
-        try:
-            parse_sss(wrapped)
-        except (SSSSyntaxError) as message:
-            print('End File {Error:"%s"}' % message)
-            continue
+        with open(filename, 'rb') as file:
+            contents = file.read()
+            wrapped = BytesIO(contents)
+            output_workbook = initialise_output(filename)
+            try:
+                parse_sss(wrapped, output_workbook)
+                output_workbook.close()
+            except (SSSSyntaxError) as message:
+                print('End File {Error:"%s"}' % message)
+                output_workbook.close()
+                continue
 
 if __name__ == '__main__':
     main()
