@@ -389,7 +389,7 @@ def parse_record(filename, record_header, header):
     record_header.unpack(header)
     payload = filename.read(record_header.data['payload_length'])
     validated = record_header.checksum(payload)
-    
+
     print('New Record', record_header.items_dict())
     if record_header.data['payload_length'] == 0:
         raise SSSSyntaxError('Zero length payload')
