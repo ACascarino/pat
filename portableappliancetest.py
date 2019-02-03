@@ -6,6 +6,7 @@
 # Usage: ./portableappliancetest.py <input.sss>
 #
 # Ported to Python 3 by Angel Cascarino, 2019-02-01
+# Sections rewritten by Tom Dufall Jan-Feb 2019
 #
 # = PAT Testing =
 # Portable Appliance Testing (PAT Inspections) are tests undertaken on
@@ -77,6 +78,7 @@ import struct
 import sys
 import collections
 from io import BytesIO
+import logging
 
 # Code is in the main() function at the bottom.  Above are helper
 # classes, and then classes for parsing the 'SSS' format itself.
@@ -374,27 +376,39 @@ class SSSSyntaxError(SyntaxError):
     pass
 
 def parse_sss(filehandle):
+    records = records_gen(filehandle, SSSRecordHeader())
     record_header = SSSRecordHeader()
+    record = None
+    while True:
+        try:
+            record = next(records)
+        except StopIteration:
+            # file parsing complete
+            break
+        parse_record(record_header, header=record[0], payload=record[1])
 
+def records_gen(filehandle, record_header):
+    # Retrieve and validate record
     while True:
         header = filehandle.read(len(record_header))
         if not header:
+            # handle this in record_header.unpack in the future
             break
-        parse_record(filehandle, record_header, header)
+        record_header.unpack(header)
+        if record_header.data['payload_length'] == 0:
+            logging.warning('Zero length payload for a record')
+            continue
+        payload = filehandle.read(record_header.data['payload_length'])
+        if not record_header.checksum(payload):
+            logging.error('Checksum validation failed for a record')
+            continue
+        yield (header, payload)
 
-def parse_record(filename, record_header, header):
+def parse_record(record_header, header, payload):
     tests = TESTS_VERSION_1.copy()
     version = 1
-
-    record_header.unpack(header)
-    payload = filename.read(record_header.data['payload_length'])
-    validated = record_header.checksum(payload)
-    
+    record_header.unpack(header)  
     print('New Record', record_header.items_dict())
-    if record_header.data['payload_length'] == 0:
-        raise SSSSyntaxError('Zero length payload')
-    if not validated:
-        raise SSSSyntaxError('Checksum validation failed')
 
     test_type = None
     while payload and test_type != 0xff:
@@ -414,6 +428,9 @@ def parse_record(filename, record_header, header):
     print()
 
 def main():
+    # set level of logging that gets displayed - debug<info<warning<error<critical
+    logging.basicConfig(level=logging.INFO)
+
     if len(sys.argv) < 2:
         print("usage: %s [input.sss]" % sys.argv[0], file=sys.stderr)
         sys.exit(2)
