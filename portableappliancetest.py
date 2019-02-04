@@ -392,13 +392,12 @@ def parse_sss(filehandle, output_workbook):
     record_id = 1
     while True:
         try:
-            record = next(records)
+            payload = next(records)
         except StopIteration:
             # file parsing complete
             break
-            
-        record_header.unpack(record[0])
-        parse_record(record_header, record[1], record_id, output_workbook)
+
+        parse_record(payload, record_id, output_workbook)
         record_id += 1
 
 def records_gen(filehandle, record_header):
@@ -416,10 +415,10 @@ def records_gen(filehandle, record_header):
         if not record_header.checksum(payload):
             logging.error('Checksum validation failed for a record')
             continue
-        yield (header, payload)
+        yield payload
 
 @static_vars(test_id=1)
-def parse_record(record_header, payload, record_id, output_workbook):
+def parse_record(payload, record_id, output_workbook):
     tests = TESTS_VERSION_1.copy()
     version = 1
 
@@ -442,44 +441,64 @@ def parse_record(record_header, payload, record_id, output_workbook):
         # Seek past to start of next sub-field
         payload = payload[len(current_test):]
 
+@static_vars(user_notes=(0, 1, 2, 3), user_counts=[0, 0, 0, 0, 0, 0])
 def report_record(record_id, current_test, test_type, test_id, output_workbook):
-    item_sheet, record_sheet, test_sheet = output_workbook.worksheets()
+    record_sheet, test_sheet = output_workbook.worksheets()[:2]
 
     #Set up constants for easy readability further down.
     #These influence the columns that each record type writes to.
     SOFTWARE_COLUMN = 8
     RECORD_DATA_COLUMN = 1
+    USER_DATA_COLUMN = 2
+    RETEST_FREQ_COLUMN = 10
+    ROW_ORDER_COLUMN = 11
+    OPTIONAL_SHEETS_OFFSET = 2
 
     tests_written = 0
 
     data_values = list(current_test.data.values())
 
-    if test_type in (0x01, 0x02, 0x11, 0x12, 0xfe):
+    if test_type in (0x01, 0x02, 0x11, 0x12, 0xfe, 0xe0, 0xe1):
         #These all modify the 'record' sheet
         if test_type == 0xfe:
             #This contains data on tester serial number and firmware version
             #Combine firmware version into one string
             firmware_version = '%d.%d.%d' % tuple(data_values[1:])
             package = [data_values[0], firmware_version]
-
             record_sheet.write_row(record_id, SOFTWARE_COLUMN, package)
+        elif test_type == 0xe0:
+            #This tells us what the User Data fields actually mean.
+            report_record.user_notes = tuple(data_values[0:4])
+            record_sheet.write(record_id, ROW_ORDER_COLUMN, str(report_record.user_notes))
+        elif test_type == 0xe1:
+            #This is the retest frequency
+            record_sheet.write(record_id, RETEST_FREQ_COLUMN, data_values[2])
         else:
             #This contains data on the record itself (time, place, tester)
             #Combine date-time related fields into a timestamp
             hour, minute, day, month, year = data_values[1:6]
             timestamp = datetime.datetime(year, month, day, hour, minute)
             package = [data_values[0], timestamp, *data_values[6:]]
-
             record_sheet.write_row(record_id, RECORD_DATA_COLUMN, package)
-        record_sheet.write(record_id + 1, 0, record_id)
+        record_sheet.write(record_id, 0, record_id)
         
     elif test_type in range(0xf0, 0xfb) or test_type == 0x10:
         #All the tests have different field meanings, so we'll just combine
         test_sheet.write_row(test_id, 0, [test_id, record_id, test_type, *data_values])
         tests_written += 1
 
-    elif test_type in (0xe1, 0xe2, 0xfb):
-        pass #do the item things
+    elif test_type == 0xfb:
+        #This modifies the "optional data" sheets
+        #These are the User Data fields.
+        #Use the mapping from the E0 test to sort into correct place.
+        #Assume 1 FB test per record, and assume FB follows an E0 record
+        for indx, data_value in enumerate(data_values):
+            if data_value:
+                target = report_record.user_notes[indx]
+                report_record.user_counts[target] += 1
+                sheet = output_workbook.worksheets()[target + OPTIONAL_SHEETS_OFFSET]
+                sheet.write_row(report_record.user_counts[target], 0, [record_id, data_value])
+
     else:
         pass
 
@@ -488,14 +507,29 @@ def report_record(record_id, current_test, test_type, test_id, output_workbook):
 def initialise_output(filename):
     output_workbook = xlsxwriter.Workbook(filename + '_output.xlsx', {'default_date_format': 'yyyy-mm-ddThh:mm'})
 
-    item_sheet = output_workbook.add_worksheet("Items")
-    item_sheet.write_row('A1', ['Item ID', 'Retest Freq.', "String 1", "String 2", "String 3", "String 4"])
-
     record_sheet = output_workbook.add_worksheet("Records")
-    record_sheet.write_row('A1', ["Record ID", "Item ID", "Timestamp", "Site", "Location", "Tester", "Testcode 1", "Testcode2", "Serial No.", "Firmware Version"])
+    record_sheet.write_row('A1', ["Record ID", "Item ID", "Timestamp", "Site", "Location", "Tester", "Testcode 1", "Testcode2", "Serial No.", "Firmware Version", "Retest Freq. (Months)", "User Data Input Order"])
 
     test_sheet = output_workbook.add_worksheet("Tests")
     test_sheet.write_row('A1', ["Test ID", "Record ID", "Test Type", "Test Parameter 1", "Test Parameter 2", "Test Parameter 3"])
+
+    notes_sheet = output_workbook.add_worksheet("Item Notes")
+    notes_sheet.write_row('A1', ["Record ID", "Notes"])
+
+    desc_sheet = output_workbook.add_worksheet("Item Description")
+    desc_sheet.write_row('A1', ["Record ID", "Asset Description"])
+
+    group_sheet = output_workbook.add_worksheet("Item Group")
+    group_sheet.write_row('A1', ["Record ID", "Asset Group"])
+
+    make_sheet = output_workbook.add_worksheet("Item Make")
+    make_sheet.write_row('A1', ["Record ID", "Make"])
+
+    model_sheet = output_workbook.add_worksheet("Item Model")
+    model_sheet.write_row('A1', ["Record ID", "Model"])
+
+    serialnumber_sheet = output_workbook.add_worksheet("Item Serial Number")
+    serialnumber_sheet.write_row('A1', ["Record ID", "Serial Number"])
 
     return output_workbook
 
